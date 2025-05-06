@@ -17,33 +17,90 @@ const batchRoutes = require("./openAI/batch");
 const filesRoutes = require("./openAI/files");
 const uploadsRoutes = require("./openAI/uploads");
 const { load: loadRandomContents } = require("./utils/randomContents");
-const delay = require("./utils/delay")
-const { register, requestCounter, requestLatency, payloadSize } = require("./utils/metrics")
+const delay = require("./utils/delay");
+const {
+  register,
+  requestCounter,
+  requestLatency,
+  payloadSize,
+} = require("./utils/metrics");
+
+const BURST = process.env.RATE_LIMIT_BURST
+  ? parseInt(process.env.RATE_LIMIT_BURST)
+  : null;
+const RATE = process.env.RATE_LIMIT_RPM
+  ? parseInt(process.env.RATE_LIMIT_RPM)
+  : null;
+
+const buckets = new Map();
+
+function rateLimit(req, res, next) {
+  // Disable if either BURST or RATE is not set
+  if (BURST === null || RATE === null) {
+    return next();
+  }
+
+  if (!req.body || !req.body.model) {
+    return next();
+  }
+
+  // Use req.body.model as the bucket key
+  const key = req.body.model;
+  const now = Date.now();
+  let bucket = buckets.get(key);
+
+  if (!bucket) {
+    bucket = { tokens: BURST, last: now };
+    buckets.set(key, bucket);
+  }
+
+  const elapsed = (now - bucket.last) / 60000;
+
+  // Calculate the replenished tokens since the last request
+  bucket.tokens = Math.min(BURST, bucket.tokens + elapsed * RATE);
+  bucket.last = now;
+
+  if (bucket.tokens >= 1) {
+    // Enough tokens available, deduct one token and proceed
+    bucket.tokens -= 1;
+    next();
+  } else {
+    res.status(429).json({ error: "Too Many Requests" });
+  }
+}
 
 const setupApp = async () => {
   await loadRandomContents();
 
   const req_limit = process.env.REQUEST_SIZE_LIMIT || "10kb";
-  app.use(express.json({"limit": req_limit}));
+  app.use(express.json({ limit: req_limit }));
+
+  app.use(rateLimit);
+
   // Request Logger Configuration
   app.use(requestId);
-  morgan.token('id', function getId(req) {
-      return req.id
+  morgan.token("id", function getId(req) {
+    return req.id;
   });
-  const loggerFormat = ':id [:date[web]]" :method :url" :status :response-time ms'
+  const loggerFormat =
+    ':id [:date[web]]" :method :url" :status :response-time ms';
 
-  app.use(morgan(loggerFormat, {
-    skip: function (req, res) {
-        return res.statusCode < 400
-    },
-    stream: process.stderr
-  }));
-  app.use(morgan(loggerFormat, {
+  app.use(
+    morgan(loggerFormat, {
       skip: function (req, res) {
-          return res.statusCode >= 400
+        return res.statusCode < 400;
       },
-      stream: process.stderr
-  }));
+      stream: process.stderr,
+    })
+  );
+  app.use(
+    morgan(loggerFormat, {
+      skip: function (req, res) {
+        return res.statusCode >= 400;
+      },
+      stream: process.stderr,
+    })
+  );
 
   app.use(chatRoutes);
   app.use(textRoutes);
@@ -59,15 +116,22 @@ const setupApp = async () => {
 
   app.get("/", async (req, res) => {
     const then = Date.now();
-    const delayHeader = req.headers["x-set-response-delay-ms"]
+    const delayHeader = req.headers["x-set-response-delay-ms"];
 
-    let delayTime = parseInt(delayHeader) || parseInt(process.env.RESPONSE_DELAY_MS) || 0
+    let delayTime =
+      parseInt(delayHeader) || parseInt(process.env.RESPONSE_DELAY_MS) || 0;
 
-    await delay(delayTime)
+    await delay(delayTime);
 
     requestCounter.inc({ method: "GET", path: "/", status: res.statusCode });
-    requestLatency.observe({ method: "GET", path: "/", status: 200 }, (Date.now() - then));
-    payloadSize.observe({ method: "GET", path: "/", status: 200 }, req.socket.bytesRead);
+    requestLatency.observe(
+      { method: "GET", path: "/", status: 200 },
+      Date.now() - then
+    );
+    payloadSize.observe(
+      { method: "GET", path: "/", status: 200 },
+      req.socket.bytesRead
+    );
     res.send("Hello World! This is MockAI");
   });
 
@@ -79,8 +143,14 @@ const setupApp = async () => {
   app.use(function (req, res) {
     const then = Date.now();
     requestCounter.inc({ method: req.method, path: req.path, status: 404 });
-    requestLatency.observe({ method: req.method, path: req.path, status: 404 }, (Date.now() - then));
-    payloadSize.observe({ method: req.method, path: req.path, status: 404 }, req.socket.bytesRead);
+    requestLatency.observe(
+      { method: req.method, path: req.path, status: 404 },
+      Date.now() - then
+    );
+    payloadSize.observe(
+      { method: req.method, path: req.path, status: 404 },
+      req.socket.bytesRead
+    );
     res.status(404).send("Page not found");
   });
 
